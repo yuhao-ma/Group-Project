@@ -1,0 +1,9 @@
+timepoint,completion_level,has_key_response,n
+T1,T1_only,TRUE,763
+T1,T2_only,FALSE,160
+T1,longitudinal,FALSE,1
+T1,longitudinal,TRUE,839
+T2,T1_only,FALSE,763
+T2,T2_only,FALSE,16
+T2,T2_only,TRUE,141
+T2,longitudinal,TRUE,843
