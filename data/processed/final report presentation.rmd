@@ -1,0 +1,570 @@
+---
+title: "Belonging and Loneliness in University Students"
+subtitle: "A longitudinal multilevel analysis of the UBelong dataset"
+author: "Bruce & Francesca"
+date: "2026-06-29"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+# Background
+
+Loneliness is an important concern among university students. University is often imagined as a socially rich environment, where students are surrounded by peers and have many opportunities to form relationships. However, many students still experience loneliness. This suggests that simply being around others may not be sufficient to protect against loneliness.
+
+A key construct that may help explain student loneliness is **sense of belonging**. Belonging refers to the extent to which students feel accepted, included, and connected within their university environment. Belonging may matter in two different ways. First, some students may generally feel a stronger sense of belonging than others, which may explain stable differences in loneliness between students. Second, the same student may feel more belonging at one time point than another, which may explain within-person fluctuations in loneliness.
+
+This project uses longitudinal data from the UBelong dataset to examine whether sense of belonging is associated with loneliness in university students. Because each participant was measured at two time points, observations are nested within participants. Multilevel modelling is therefore appropriate because it accounts for the non-independence of repeated observations from the same student.
+
+# Research Questions and Hypotheses
+
+## Research Questions
+
+1. Does loneliness change from T1 to T2 among university students?
+
+2. Is sense of belonging associated with loneliness at the between-person level?
+
+3. Is sense of belonging associated with loneliness at the within-person level?
+
+The between-person effect asks whether students who generally report higher belonging also report lower loneliness overall. The within-person effect asks whether the same student reports lower loneliness at time points when their belonging is higher than their own average.
+
+## Hypotheses
+
+**H1:** Loneliness will change significantly from T1 to T2.
+
+**H2:** Students with higher average belonging will report lower loneliness overall.
+
+**H3:** When a student reports higher belonging than their own average, they will report lower loneliness at that time point.
+
+# Data and Packages
+
+```{r packages-and-data}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(emmeans)
+
+data <- read_csv(
+  "ubelong_longitudinalData_FINAL201225_forReShare.csv",
+  show_col_types = FALSE
+)
+```
+
+The outcome variable was `UCLA_freq`, a UCLA loneliness frequency score. Higher values indicate greater loneliness.
+
+The main predictor was `BES_full_score`, a belonging scale score. Higher values indicate stronger sense of belonging.
+
+Time was coded as:
+
+* T1 = 0
+* T2 = 1
+
+The adjusted model also included survey year, sex, and year of study as covariates.
+
+# Data Structure and Missingness
+
+## Checking the repeated-measures structure
+
+```{r check-timepoints}
+data %>%
+  count(timepoint)
+```
+
+```{r check-participant-rows}
+data %>%
+  count(participant_id) %>%
+  count(n)
+```
+
+The original dataset contains two rows for each participant, corresponding to T1 and T2. This confirms that the data have a repeated-measures structure, with time-point observations nested within participants.
+
+## Overall missingness
+
+```{r overall-missingness}
+data %>%
+  summarise(
+    n_rows = n(),
+    n_participants = n_distinct(participant_id),
+    missing_ucla = sum(is.na(UCLA_freq)),
+    missing_belonging = sum(is.na(BES_full_score)),
+    missing_timepoint = sum(is.na(timepoint))
+  )
+```
+
+## Missingness by time point
+
+```{r missingness-by-timepoint}
+data %>%
+  group_by(timepoint) %>%
+  summarise(
+    n = n(),
+    missing_ucla = sum(is.na(UCLA_freq)),
+    missing_ucla_pct = mean(is.na(UCLA_freq)) * 100,
+    missing_belonging = sum(is.na(BES_full_score)),
+    missing_belonging_pct = mean(is.na(BES_full_score)) * 100
+  )
+```
+
+Missingness was substantially higher at T2 than T1. In the exploratory checks, T1 had approximately 11.1% missingness for UCLA loneliness and 9.1% missingness for belonging, whereas T2 had approximately 44.8% missingness for UCLA loneliness and 44.2% missingness for belonging. This indicates substantial follow-up missingness.
+
+# Attrition Check
+
+Because T2 missingness was substantial, I examined whether participants with and without observed T2 loneliness data differed on baseline loneliness and baseline belonging.
+
+```{r create-attrition-variables}
+t2_status <- data %>%
+  select(participant_id, timepoint, UCLA_freq, BES_full_score) %>%
+  mutate(
+    ucla_observed = !is.na(UCLA_freq),
+    bes_observed = !is.na(BES_full_score)
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    t2_ucla_observed = ucla_observed[timepoint == "T2"],
+    t2_bes_observed = bes_observed[timepoint == "T2"],
+    .groups = "drop"
+  )
+
+t1_attrition <- data %>%
+  filter(timepoint == "T1") %>%
+  left_join(t2_status, by = "participant_id")
+```
+
+```{r attrition-descriptives}
+t1_attrition %>%
+  group_by(t2_ucla_observed) %>%
+  summarise(
+    n = n(),
+    mean_t1_ucla = mean(UCLA_freq, na.rm = TRUE),
+    sd_t1_ucla = sd(UCLA_freq, na.rm = TRUE),
+    mean_t1_belonging = mean(BES_full_score, na.rm = TRUE),
+    sd_t1_belonging = sd(BES_full_score, na.rm = TRUE)
+  )
+```
+
+```{r attrition-tests}
+t.test(UCLA_freq ~ t2_ucla_observed, data = t1_attrition)
+t.test(BES_full_score ~ t2_ucla_observed, data = t1_attrition)
+```
+
+Participants with and without T2 loneliness data did not significantly differ in baseline loneliness, *p* = .210. However, participants with observed T2 loneliness data had significantly higher baseline belonging than those missing T2 loneliness data, *p* < .001. This suggests that attrition was not clearly associated with baseline loneliness, but was associated with baseline belonging. Students with lower initial belonging were more likely to be missing at follow-up.
+
+# Analysis Sample
+
+To ensure that all models were compared using the same sample, I created a complete-case analysis sample using all variables included in the final model.
+
+```{r create-analysis-sample}
+data_analysis <- data %>%
+  mutate(
+    participant_id = factor(participant_id),
+    timepoint_f = factor(timepoint, levels = c("T1", "T2")),
+    time_c = if_else(timepoint == "T2", 1, 0),
+    surveyYear_f = factor(surveyYear),
+    sex_f = factor(sex),
+    yearOfStudy_f = factor(yearOfStudy)
+  ) %>%
+  select(
+    participant_id,
+    timepoint,
+    timepoint_f,
+    time_c,
+    UCLA_freq,
+    BES_full_score,
+    surveyYear_f,
+    sex_f,
+    yearOfStudy_f
+  ) %>%
+  drop_na()
+```
+
+```{r analysis-sample-summary}
+data_analysis %>%
+  summarise(
+    n_obs = n(),
+    n_participants = n_distinct(participant_id)
+  )
+```
+
+```{r analysis-sample-timepoints}
+data_analysis %>%
+  count(timepoint_f)
+```
+
+```{r analysis-sample-valid-observations}
+data_analysis %>%
+  count(participant_id) %>%
+  count(n)
+```
+
+The final analysis sample contained 2,398 observations from 1,584 participants. Of these, 814 participants had valid data at both T1 and T2, while 770 participants contributed one valid observation. Therefore, the multilevel models used all available observations, but within-person change estimates were mainly informed by the 814 participants with valid observations at both time points.
+
+# Descriptive Statistics
+
+
+
+```{r descriptive-statistics}
+data_analysis %>%
+  group_by(timepoint_f) %>%
+  summarise(
+    n = n(),
+    mean_loneliness = mean(UCLA_freq, na.rm = TRUE),
+    sd_loneliness = sd(UCLA_freq, na.rm = TRUE),
+    mean_belonging = mean(BES_full_score, na.rm = TRUE),
+    sd_belonging = sd(BES_full_score, na.rm = TRUE)
+  ) %>%
+  knitr::kable(digits = 2)
+```
+
+```{r plot-loneliness-by-time}
+ggplot(data_analysis, aes(x = timepoint_f, y = UCLA_freq)) +
+  geom_boxplot(outlier.alpha = 0.25) +
+  geom_jitter(width = 0.12, alpha = 0.20) +
+  labs(
+    x = "Time point",
+    y = "UCLA loneliness frequency",
+    title = "Loneliness at T1 and T2"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-individual-change}
+set.seed(123)
+
+n_ids <- data_analysis %>%
+  distinct(participant_id) %>%
+  nrow()
+
+sample_ids <- data_analysis %>%
+  distinct(participant_id) %>%
+  slice_sample(n = min(100, n_ids))
+
+data_analysis %>%
+  semi_join(sample_ids, by = "participant_id") %>%
+  ggplot(aes(x = time_c, y = UCLA_freq, group = participant_id)) +
+  geom_line(alpha = 0.25) +
+  geom_point(alpha = 0.35) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.2) +
+  scale_x_continuous(breaks = c(0, 1), labels = c("T1", "T2")) +
+  labs(
+    x = "Time point",
+    y = "UCLA loneliness frequency",
+    title = "Individual and average change in loneliness"
+  ) +
+  theme_minimal()
+```
+
+# Within-Person and Between-Person Centering
+
+Belonging was decomposed into within-person and between-person components.
+
+The **between-person belonging** variable represents each participant’s average belonging across available observations. This tests whether students with generally higher belonging report lower loneliness overall.
+
+The **within-person belonging** variable represents each participant’s deviation from their own average belonging at each time point. This tests whether a student reports lower loneliness at time points when their belonging is higher than their own average.
+
+```{r centering}
+data_analysis <- data_analysis %>%
+  group_by(participant_id) %>%
+  mutate(
+    belonging_person_mean = mean(BES_full_score),
+    belonging_within = BES_full_score - belonging_person_mean
+  ) %>%
+  ungroup() %>%
+  mutate(
+    belonging_between = as.numeric(scale(
+      belonging_person_mean,
+      center = TRUE,
+      scale = FALSE
+    ))
+  )
+```
+
+# Statistical Analysis
+
+Multilevel linear models were fitted with repeated observations nested within participants. A random intercept for participant was included to account for non-independence of observations from the same student.
+
+The model-building strategy was:
+
+* Model 0: null random-intercept model
+* Model 1: added time
+* Model 2: added within-person belonging
+* Model 3: added between-person belonging
+* Model 4: added covariates
+
+Models were compared using maximum likelihood estimation because the fixed-effect structure changed across models. The final retained model was then refitted using restricted maximum likelihood.
+
+# Model 0: Null Model
+
+```{r model0}
+m0 <- lmer(
+  UCLA_freq ~ 1 + (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m0)
+performance::icc(m0)
+```
+
+The null model was used to estimate the intraclass correlation coefficient. The ICC was approximately .572, indicating that about 57.2% of the variance in loneliness was between participants. This supports the use of multilevel modelling because repeated observations from the same participant were not independent.
+
+# Model 1: Time Effect
+
+```{r model1}
+m1 <- lmer(
+  UCLA_freq ~ time_c + (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m1)
+```
+
+Model 1 tested whether loneliness changed from T1 to T2.
+
+# Model 2: Within-Person Belonging
+
+```{r model2}
+m2 <- lmer(
+  UCLA_freq ~ time_c + belonging_within +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m2)
+```
+
+Model 2 tested whether time-specific deviations in belonging were associated with loneliness within the same student.
+
+# Model 3: Between-Person Belonging
+
+```{r model3}
+m3 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m3)
+```
+
+Model 3 tested whether students with higher average belonging reported lower loneliness overall.
+
+# Model 4: Adjusted Model with Covariates
+
+```{r model4}
+m4 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m4)
+```
+
+Model 4 added survey year, sex, and year of study.
+
+# Model Comparison
+
+```{r model-comparison}
+model_comparison <- anova(m0, m1, m2, m3, m4)
+
+model_comparison %>%
+  as.data.frame() %>%
+  rownames_to_column("Model") %>%
+  knitr::kable(digits = 3)
+```
+
+```{r model-fit-table}
+model_fit <- tibble(
+  Model = c("m0", "m1", "m2", "m3", "m4"),
+  Description = c(
+    "Null model",
+    "Time",
+    "Time + within-person belonging",
+    "Time + within-person + between-person belonging",
+    "Adjusted model with covariates"
+  ),
+  df = c(
+    attr(logLik(m0), "df"),
+    attr(logLik(m1), "df"),
+    attr(logLik(m2), "df"),
+    attr(logLik(m3), "df"),
+    attr(logLik(m4), "df")
+  ),
+  AIC = c(AIC(m0), AIC(m1), AIC(m2), AIC(m3), AIC(m4)),
+  BIC = c(BIC(m0), BIC(m1), BIC(m2), BIC(m3), BIC(m4))
+)
+
+model_fit %>%
+  knitr::kable(digits = 2)
+```
+
+Adding time significantly improved model fit compared with the null model, indicating that loneliness changed from T1 to T2. Adding within-person belonging further improved model fit. Adding between-person belonging produced the largest additional improvement, suggesting that stable differences in belonging between students explained substantial variation in loneliness. Finally, adding covariates also significantly improved model fit.
+
+Although the adjusted model improved fit according to the likelihood-ratio test and slightly reduced AIC, BIC favoured the more parsimonious Model 3. Because the covariates were theoretically relevant, Model 4 was retained as the adjusted model.
+
+# Random Slope Check
+
+A random slope for time was considered because students may differ in their change in loneliness from T1 to T2. However, this model could not be estimated because the number of random effects exceeded the number of observations. This was likely due to the two-wave design and substantial missingness at T2, with many participants contributing only one valid observation.
+
+The code below is shown for transparency but is not evaluated because it produces an identification error.
+
+```{r random-slope-check, eval=FALSE}
+m4_rs <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 + time_c | participant_id),
+  data = data_analysis,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(m4_rs)
+isSingular(m4_rs)
+```
+
+Therefore, the simpler random-intercept model was retained.
+
+# Final REML Model
+
+The final adjusted model was refitted using restricted maximum likelihood.
+
+```{r final-model}
+m_final <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = TRUE
+)
+
+summary(m_final)
+performance::icc(m_final)
+performance::r2_nakagawa(m_final)
+```
+
+```{r final-model-table}
+final_fixed <- coef(summary(m_final)) %>%
+  as.data.frame() %>%
+  rownames_to_column("Predictor")
+
+final_fixed %>%
+  knitr::kable(digits = 3)
+```
+
+The final model showed that loneliness was significantly lower at T2 than T1. The estimate for time was approximately -0.43, meaning that UCLA loneliness frequency was about 0.43 points lower at T2 than T1, after adjusting for belonging and covariates.
+
+Within-person belonging was significantly negatively associated with loneliness. This means that when a student reported belonging that was one point higher than their own average, their loneliness score was approximately 0.16 points lower at that time point.
+
+Between-person belonging was also significantly negatively associated with loneliness. Students with higher average belonging reported substantially lower loneliness overall. The between-person belonging effect was larger than the within-person belonging effect, suggesting that stable differences in belonging between students were more strongly associated with loneliness than time-specific fluctuations in belonging within the same student.
+
+The marginal R² was approximately .190, indicating that the fixed effects explained about 19.0% of the variance in loneliness. The conditional R² was approximately .602, indicating that the fixed effects plus participant-level random intercepts explained about 60.2% of the variance.
+
+# Model Diagnostics
+
+```{r diagnostics-residual-fitted}
+plot(fitted(m_final), resid(m_final),
+     xlab = "Fitted values",
+     ylab = "Residuals",
+     main = "Residuals vs fitted values")
+abline(h = 0, lty = 2)
+```
+
+```{r diagnostics-residual-qq}
+qqnorm(resid(m_final), main = "Q-Q plot of residuals")
+qqline(resid(m_final))
+```
+
+```{r diagnostics-random-intercepts}
+ranef_values <- ranef(m_final)$participant_id[, "(Intercept)"]
+
+qqnorm(ranef_values, main = "Q-Q plot of participant random intercepts")
+qqline(ranef_values)
+```
+
+Model diagnostics were inspected using residual-versus-fitted plots and Q-Q plots of residuals and participant-level random intercepts. The residual-versus-fitted plot showed diagonal banding, which likely reflected the discrete and bounded nature of the UCLA loneliness score. Residuals were generally centred around zero, although some tail deviations were visible in the Q-Q plot. The Q-Q plot for participant-level random intercepts was broadly consistent with normality, with mild deviations at the tails.
+
+Overall, the diagnostics did not suggest severe violations that would invalidate the model. However, because the outcome was a bounded scale score, the linear mixed model should be interpreted as an approximate model for the loneliness scale.
+
+# Sensitivity Analysis: Complete Two-Wave Sample
+
+Because missingness at T2 was substantial, a sensitivity analysis was conducted using only participants with valid data at both T1 and T2.
+
+```{r sensitivity-sample}
+complete_ids <- data_analysis %>%
+  count(participant_id) %>%
+  filter(n == 2) %>%
+  pull(participant_id)
+
+data_complete2 <- data_analysis %>%
+  filter(participant_id %in% complete_ids)
+
+data_complete2 %>%
+  summarise(
+    n_obs = n(),
+    n_participants = n_distinct(participant_id)
+  )
+```
+
+```{r sensitivity-model}
+m_final_complete2 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_complete2,
+  REML = TRUE
+)
+
+summary(m_final_complete2)
+performance::r2_nakagawa(m_final_complete2)
+```
+
+The sensitivity analysis produced results that were highly consistent with the main analysis. Loneliness was still significantly lower at T2 than T1. Within-person belonging remained significantly negatively associated with loneliness. Between-person belonging also remained significantly negatively associated with loneliness.
+
+The R² values were also very similar to the main analysis, with marginal R² around .187 and conditional R² around .605. These results suggest that the main findings were robust to restricting the sample to participants with complete two-wave data.
+
+# Discussion
+
+This analysis found that loneliness decreased from T1 to T2. Lower belonging was associated with higher loneliness at both the between-person and within-person levels. Students who generally felt a stronger sense of belonging reported lower loneliness overall. In addition, the same student reported lower loneliness at time points when their belonging was higher than their own average.
+
+The between-person effect of belonging was larger than the within-person effect. This suggests that stable differences in students’ overall sense of belonging may be particularly important for understanding loneliness. However, the significant within-person effect also suggests that changes or fluctuations in belonging within the same student are meaningful.
+
+These findings highlight the importance of belonging for student loneliness. They also show why it is useful to separate within-person and between-person effects in longitudinal data. If belonging had been entered into the model as a single raw score, it would have mixed two different questions: whether students with higher belonging are less lonely overall, and whether students are less lonely at times when their own belonging is higher than usual.
+
+# Limitations
+
+Several limitations should be noted.
+
+First, the dataset included only two time points. This allowed analysis of baseline-to-follow-up change, but it did not support modelling complex growth trajectories. A random slope for time was considered but could not be estimated because the number of random effects exceeded the number of observations.
+
+Second, missingness at T2 was substantial. Although baseline loneliness did not significantly differ between participants with and without T2 loneliness data, baseline belonging did differ. Students with lower initial belonging were less likely to have observed T2 loneliness data. This means that the longitudinal findings may underrepresent students with lower initial belonging.
+
+Third, the analysis was observational. Therefore, the results should not be interpreted as evidence that belonging causes lower loneliness. It is also possible that loneliness reduces belonging, or that both are influenced by other variables such as social anxiety, mental health, financial stress, or social network structure.
+
+Fourth, the outcome was a bounded scale score. Model diagnostics suggested that the linear mixed model was broadly acceptable, but residual plots showed patterns consistent with the discrete nature of the outcome.
+
+# Conclusion
+
+This project used longitudinal multilevel modelling to examine the association between belonging and loneliness in university students. The null model showed substantial participant-level clustering, supporting the use of multilevel modelling. Loneliness decreased from T1 to T2, and belonging was significantly negatively associated with loneliness at both the within-person and between-person levels.
+
+Students with generally higher belonging reported lower loneliness overall, and students also reported lower loneliness at time points when their belonging was higher than their own average. These findings suggest that belonging is an important construct for understanding loneliness in university students and demonstrate the value of separating within-person and between-person associations in longitudinal multilevel models.
