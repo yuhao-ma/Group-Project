@@ -1,0 +1,306 @@
+---
+title: "datacode"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+date: "2026-06-29"
+---
+##Step 0: packages and data
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(emmeans)
+
+
+data <- read_csv("ubelong_longitudinalData_FINAL201225_forReShare.csv",
+                 show_col_types = FALSE)
+```
+
+## step1 check nesting
+
+```{r cars}
+
+data %>%
+  count(timepoint)
+
+
+data %>%
+  count(participant_id) %>%
+  count(n)
+
+
+data %>%
+  summarise(
+    n_rows = n(),
+    n_participants = n_distinct(participant_id),
+    missing_ucla = sum(is.na(UCLA_freq)),
+    missing_belonging = sum(is.na(BES_full_score)),
+    missing_timepoint = sum(is.na(timepoint))
+  )
+```
+```{r}
+data %>%
+  count(participant_id) %>%
+  count(n)
+```
+```{r}
+data %>%
+  group_by(timepoint) %>%
+  summarise(
+    n = n(),
+    missing_ucla = sum(is.na(UCLA_freq)),
+    missing_ucla_pct = mean(is.na(UCLA_freq)) * 100,
+    missing_belonging = sum(is.na(BES_full_score)),
+    missing_belonging_pct = mean(is.na(BES_full_score)) * 100
+  )
+```
+##Step 1.5：检查 T2 缺失是不是系统性的
+```{r}
+t2_status <- data %>%
+  select(participant_id, timepoint, UCLA_freq, BES_full_score) %>%
+  mutate(
+    ucla_observed = !is.na(UCLA_freq),
+    bes_observed = !is.na(BES_full_score)
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    t2_ucla_observed = ucla_observed[timepoint == "T2"],
+    t2_bes_observed = bes_observed[timepoint == "T2"],
+    .groups = "drop"
+  )
+
+t1_attrition <- data %>%
+  filter(timepoint == "T1") %>%
+  left_join(t2_status, by = "participant_id")
+```
+time2：
+```{r}
+
+
+t1_attrition %>%
+  group_by(t2_ucla_observed) %>%
+  summarise(
+    n = n(),
+    mean_t1_ucla = mean(UCLA_freq, na.rm = TRUE),
+    sd_t1_ucla = sd(UCLA_freq, na.rm = TRUE),
+    mean_t1_belonging = mean(BES_full_score, na.rm = TRUE),
+    sd_t1_belonging = sd(BES_full_score, na.rm = TRUE)
+  )
+```
+```{r}
+t.test(UCLA_freq ~ t2_ucla_observed, data = t1_attrition)
+t.test(BES_full_score ~ t2_ucla_observed, data = t1_attrition)
+```
+
+##Step 2: define analysis sample
+```{r}
+data_analysis <- data %>%
+  mutate(
+    participant_id = factor(participant_id),
+    timepoint_f = factor(timepoint, levels = c("T1", "T2")),
+    time_c = if_else(timepoint == "T2", 1, 0),
+    surveyYear_f = factor(surveyYear),
+    sex_f = factor(sex),
+    yearOfStudy_f = factor(yearOfStudy)
+  ) %>%
+  select(
+    participant_id,
+    timepoint,
+    timepoint_f,
+    time_c,
+    UCLA_freq,
+    BES_full_score,
+    surveyYear_f,
+    sex_f,
+    yearOfStudy_f
+  ) %>%
+  drop_na()
+
+```
+检查模型样本
+```{r}
+data_analysis %>%
+  summarise(
+    n_obs = n(),
+    n_participants = n_distinct(participant_id)
+  )
+
+data_analysis %>%
+  count(timepoint_f)
+
+data_analysis %>%
+  count(participant_id) %>%
+  count(n)
+```
+##step3：centering
+```{r}
+data_analysis <- data_analysis %>%
+  group_by(participant_id) %>%
+  mutate(
+    belonging_person_mean = mean(BES_full_score),
+    belonging_within = BES_full_score - belonging_person_mean
+  ) %>%
+  ungroup() %>%
+  mutate(
+    belonging_between = as.numeric(scale(
+      belonging_person_mean,
+      center = TRUE,
+      scale = FALSE
+    ))
+  )
+```
+##model0：nonmodel
+```{r}
+m0 <- lmer(
+  UCLA_freq ~ 1 + (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m0)
+performance::icc(m0)
+```
+
+##model1:time effect
+
+```{r}
+m1 <- lmer(
+  UCLA_freq ~ time_c + (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m1)
+```
+
+##Model 2: 加 within-person belonging
+
+```{r}
+m2 <- lmer(
+  UCLA_freq ~ time_c + belonging_within +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m2)
+```
+##model3：between person belonging
+```{r}
+m3 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m3)
+```
+
+##model4 covirates
+```{r}
+m4 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+
+summary(m4)
+```
+
+##Model comparison
+```{r}
+anova(m0, m1, m2, m3, m4)
+AIC(m0, m1, m2, m3, m4)
+BIC(m0, m1, m2, m3, m4)
+```
+##random slope check
+
+m4_rs <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 + time_c | participant_id),
+  data = data_analysis,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(m4_rs)
+isSingular(m4_rs)
+
+Random slopes for time were considered but could not be estimated because the number of random effects exceeded the number of observations. Therefore, the simpler random-intercept model was retained.
+
+##model4 as retained model
+```{r}
+m4 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = FALSE
+)
+```
+##final REML model
+```{r}
+m_final <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_analysis,
+  REML = TRUE
+)
+
+summary(m_final)
+performance::icc(m_final)
+performance::r2_nakagawa(m_final)
+```
+用 time、within-person belonging、between-person belonging 和 covariates 预测 UCLA loneliness，并允许每个 participant 有自己的 random intercept。
+
+也就是：
+
+fixed effects：平均效应；
+random intercept：每个学生有自己的平均 loneliness 水平；
+没有 random slope：因为数据不支持估计 individual change slope。
+
+###A. Assumption checks
+```{r}
+# Residuals vs fitted: check homoscedasticity / nonlinearity
+plot(fitted(m_final), resid(m_final))
+abline(h = 0, lty = 2)
+
+# Normality of level-1 residuals
+qqnorm(resid(m_final))
+qqline(resid(m_final))
+
+# Normality of random intercepts
+ranef_values <- ranef(m_final)$participant_id[, "(Intercept)"]
+qqnorm(ranef_values)
+qqline(ranef_values)
+```
+###B. Complete two-wave sensitivity analysis（for t2 missing）
+```{r}
+complete_ids <- data_analysis %>%
+  count(participant_id) %>%
+  filter(n == 2) %>%
+  pull(participant_id)
+
+data_complete2 <- data_analysis %>%
+  filter(participant_id %in% complete_ids)
+
+m_final_complete2 <- lmer(
+  UCLA_freq ~ time_c + belonging_within + belonging_between +
+    surveyYear_f + sex_f + yearOfStudy_f +
+    (1 | participant_id),
+  data = data_complete2,
+  REML = TRUE
+)
+
+summary(m_final_complete2)
+performance::r2_nakagawa(m_final_complete2)
+```
+
